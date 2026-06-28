@@ -25,16 +25,14 @@ const unsigned long DEBOUNCE_MS     = 250;
 // Pressure-trend thresholds (hPa change over the tracking window)
 const float    PRESSURE_FALLING_FAST = -2.0F;  // sharp drop - rain likely soon
 const float    PRESSURE_FALLING_SLOW = -0.7F;  // gentle drop - rain possible later
-const float    PRESSURE_RISING_FAST  = 2.0F;   // sharp rise - clearing up
 const float    PRESSURE_RISING_SLOW  = 0.7F;   // gentle rise - improving
 const int      PRESSURE_HISTORY_SIZE = 5;       // ~10 sec of readings at 2s loop
 
 // ---------- Text size constants ----------
 const int      HEADER_TEXT_SIZE   = 2;
-const int      BIG_TEXT_SIZE       = 3;
-const int      BODY_TEXT_SIZE     = 2;
+const int      SENTENCE_MAX_SIZE  = 2;   // largest size tried for the advice sentence
 const int      FOOTER_TEXT_SIZE   = 1;
-const int      CHAR_PIXEL_WIDTH   = 6;
+const int      CHAR_PIXEL_WIDTH   = 6;   // base width of one character at text size 1
 
 // ---------- Colours ----------
 const uint16_t COLOR_BG       = ST77XX_BLACK;
@@ -44,9 +42,6 @@ const uint16_t COLOR_GOOD     = ST77XX_GREEN;
 const uint16_t COLOR_WARN     = ST77XX_YELLOW;
 const uint16_t COLOR_BAD      = ST77XX_RED;
 const uint16_t COLOR_LABEL    = ST77XX_CYAN;
-const uint16_t COLOR_SUN      = ST77XX_YELLOW;
-const uint16_t COLOR_CLOUD    = ST77XX_WHITE;
-const uint16_t COLOR_RAIN     = ST77XX_CYAN;
 
 // ---------- Sensor objects ----------
 Adafruit_AHTX0  aht;
@@ -63,11 +58,19 @@ struct SensorReading {
   float lightLux;
 };
 
+// Icons available to represent advice at a glance, drawn with basic shapes
+enum AdviceIcon { ICON_RAIN, ICON_SUN, ICON_CLOUD, ICON_BULB, ICON_SNOWFLAKE };
+
+// One complete piece of advice: what to say, how urgent/coloured it is, and
+// which icon best represents it.
+struct AdviceMessage {
+  String     sentence;
+  uint16_t   color;
+  AdviceIcon icon;
+};
+
 enum ScreenMode { SCREEN_FRIENDLY, SCREEN_RAWDATA };
 ScreenMode currentScreen = SCREEN_FRIENDLY;
-
-// Weather condition derived from pressure trend, used to pick an icon
-enum WeatherIcon { ICON_RAIN, ICON_CLOUD, ICON_SUN };
 
 int  lastFriendlyState = LOW;
 int  lastRawDataState  = LOW;
@@ -126,64 +129,56 @@ float updatePressureTrend(float currentPressure) {
   return currentPressure - oldestPressure;
 }
 
-String getWeatherAdvice(float pressureTrend) {
-  if (pressureTrend <= PRESSURE_FALLING_FAST) return "Rain likely soon, take an umbrella";
-  if (pressureTrend <= PRESSURE_FALLING_SLOW) return "Showers possible later today";
-  if (pressureTrend >= PRESSURE_RISING_FAST)  return "Clearing up, great time outside";
-  if (pressureTrend >= PRESSURE_RISING_SLOW)  return "Conditions improving";
-  return "Weather looking steady";
-}
+// ---------------------------------------------------------------------------
+// buildAdviceMessage - takes ALL the sensor data and the pressure trend and
+// returns ONE clear sentence telling the user what to do, picked by priority
+// (most important / urgent advice wins). This is the only thing the friendly
+// screen needs to know how to draw.
+// ---------------------------------------------------------------------------
+AdviceMessage buildAdviceMessage(const SensorReading &data, float pressureTrend) {
+  // Priority 1: rain warning - most actionable, affects whether you go outside
+  if (pressureTrend <= PRESSURE_FALLING_FAST) {
+    return { "Rain is coming - grab an umbrella!", COLOR_BAD, ICON_RAIN };
+  }
+  if (pressureTrend <= PRESSURE_FALLING_SLOW) {
+    return { "Showers possible - keep an umbrella handy", COLOR_WARN, ICON_RAIN };
+  }
 
-uint16_t getWeatherColor(float pressureTrend) {
-  if (pressureTrend <= PRESSURE_FALLING_FAST) return COLOR_BAD;
-  if (pressureTrend <= PRESSURE_FALLING_SLOW) return COLOR_WARN;
-  if (pressureTrend >= PRESSURE_RISING_SLOW)  return COLOR_GOOD;
-  return COLOR_TEXT;
-}
+  // Priority 2: dangerous UV - safety advice
+  if (data.uvIndex >= 8) {
+    return { "UV is very high - wear sunscreen now!", COLOR_BAD, ICON_SUN };
+  }
+  if (data.uvIndex >= 6) {
+    return { "Strong sun out - sunscreen recommended", COLOR_WARN, ICON_SUN };
+  }
 
-// Picks which icon best represents the current pressure trend
-WeatherIcon getWeatherIcon(float pressureTrend) {
-  if (pressureTrend <= PRESSURE_FALLING_SLOW) return ICON_RAIN;
-  if (pressureTrend >= PRESSURE_RISING_SLOW)  return ICON_SUN;
-  return ICON_CLOUD;
-}
+  // Priority 3: temperature comfort
+  if (data.temperatureC > 28 && data.humidityPct > 60) {
+    return { "Hot and humid - drink plenty of water", COLOR_WARN, ICON_SUN };
+  }
+  if (data.temperatureC > 28) {
+    return { "It's a hot day - dress light and stay cool", COLOR_WARN, ICON_SUN };
+  }
+  if (data.temperatureC < 15) {
+    return { "Feeling cold - wear a warm jacket", COLOR_LABEL, ICON_SNOWFLAKE };
+  }
 
-String getComfortMessage(float tempC, float humidityPct) {
-  if (tempC > 28 && humidityPct > 60) return "Hot & humid";
-  if (tempC > 28)                     return "It's hot today";
-  if (tempC < 15)                     return "Feeling cold";
-  if (humidityPct > 70)                return "Quite humid";
-  return "Comfortable";
-}
+  // Priority 4: lighting
+  if (data.lightLux < 10) {
+    return { "It's dark - turn on the lights", COLOR_WARN, ICON_BULB };
+  }
 
-String getUVAdvice(float uvIndex) {
-  if (uvIndex < 3)  return "UV Low";
-  if (uvIndex < 6)  return "UV Moderate";
-  if (uvIndex < 8)  return "UV High";
-  return "UV Very High";
-}
+  // Priority 5: pressure rising - good news, nothing urgent needed
+  if (pressureTrend >= PRESSURE_RISING_SLOW) {
+    return { "Skies clearing - a great time to be outside!", COLOR_GOOD, ICON_SUN };
+  }
 
-String getLightDescription(float lux) {
-  if (lux < 10)   return "Dark";
-  if (lux < 200)  return "Dim light";
-  if (lux < 1000) return "Bright light";
-  return "Daylight";
-}
-
-uint16_t getTempColor(float tempC) {
-  if (tempC < 15 || tempC > 30) return COLOR_BAD;
-  if (tempC < 18 || tempC > 27) return COLOR_WARN;
-  return COLOR_GOOD;
-}
-
-uint16_t getUVColor(float uvIndex) {
-  if (uvIndex >= 8) return COLOR_BAD;
-  if (uvIndex >= 3) return COLOR_WARN;
-  return COLOR_GOOD;
+  // Default - everything is comfortable, no action needed
+  return { "Conditions look comfortable - enjoy your day!", COLOR_GOOD, ICON_CLOUD };
 }
 
 // ---------------------------------------------------------------------------
-// Serial Monitor - cleaner aligned table instead of a plain list
+// Serial Monitor - raw data table, always printed regardless of screen mode
 // ---------------------------------------------------------------------------
 void printDataToSerial(const SensorReading &data, float pressureTrend) {
   Serial.println();
@@ -209,131 +204,174 @@ void drawHeader(const char* title) {
 }
 
 // ---------------------------------------------------------------------------
-// Hand-drawn weather icons using basic GFX shapes (no emoji font needed)
-// Each is drawn inside roughly a 28x28 box centred at (cx, cy)
+// Hand-drawn icons using basic GFX shapes (no emoji font available on TFT)
+// Each is drawn centred at (cx, cy)
 // ---------------------------------------------------------------------------
 void drawSunIcon(int cx, int cy, uint16_t color) {
-  const int radius = 8;
+  const int radius = 9;
   tft.fillCircle(cx, cy, radius, color);
-
-  // 8 rays radiating outward
   for (int i = 0; i < 8; i++) {
     float angle = i * (PI / 4.0);
     int x1 = cx + (int)((radius + 3) * cos(angle));
     int y1 = cy + (int)((radius + 3) * sin(angle));
-    int x2 = cx + (int)((radius + 8) * cos(angle));
-    int y2 = cy + (int)((radius + 8) * sin(angle));
+    int x2 = cx + (int)((radius + 9) * cos(angle));
+    int y2 = cy + (int)((radius + 9) * sin(angle));
     tft.drawLine(x1, y1, x2, y2, color);
   }
 }
 
 void drawCloudIcon(int cx, int cy, uint16_t color) {
-  tft.fillCircle(cx - 7, cy + 2, 7, color);
-  tft.fillCircle(cx + 3, cy - 3, 9, color);
-  tft.fillCircle(cx + 12, cy + 2, 6, color);
-  tft.fillRect(cx - 13, cy + 2, 32, 8, color);
+  tft.fillCircle(cx - 8, cy + 2, 8, color);
+  tft.fillCircle(cx + 4, cy - 4, 10, color);
+  tft.fillCircle(cx + 14, cy + 2, 7, color);
+  tft.fillRect(cx - 15, cy + 2, 38, 9, color);
 }
 
 void drawUmbrellaIcon(int cx, int cy, uint16_t color) {
-  const int radius = 10;
+  const int radius = 12;
 
-  // Canopy - top half of a circle (fill circle, then erase the bottom half)
+  // Canopy - top half of a circle
   tft.fillCircle(cx, cy, radius, color);
   tft.fillRect(cx - radius, cy, radius * 2, radius, COLOR_BG);
 
-  // Scalloped bottom edge of the canopy - little notches
+  // Scalloped bottom edge
   for (int i = -1; i <= 1; i++) {
     tft.fillCircle(cx + (i * (radius / 1.5)), cy, 2, COLOR_BG);
   }
 
   // Pole
-  tft.drawLine(cx, cy, cx, cy + 14, color);
+  tft.drawLine(cx, cy, cx, cy + 16, color);
 
-  // Handle hook at the bottom
-  tft.drawLine(cx, cy + 14, cx - 4, cy + 14, color);
-  tft.drawLine(cx - 4, cy + 14, cx - 4, cy + 10, color);
+  // Handle hook
+  tft.drawLine(cx, cy + 16, cx - 5, cy + 16, color);
+  tft.drawLine(cx - 5, cy + 16, cx - 5, cy + 11, color);
 
-  // Rain drops falling beside the umbrella for extra clarity
-  tft.drawLine(cx + 16, cy - 4, cx + 14, cy + 2, color);
-  tft.drawLine(cx + 22, cy - 2, cx + 20, cy + 4, color);
+  // Raindrops beside the umbrella
+  tft.drawLine(cx + 19, cy - 4, cx + 16, cy + 3, color);
+  tft.drawLine(cx + 26, cy - 2, cx + 23, cy + 5, color);
 }
 
-void drawWeatherIcon(WeatherIcon icon, int cx, int cy, uint16_t color) {
+void drawBulbIcon(int cx, int cy, uint16_t color) {
+  tft.fillCircle(cx, cy - 2, 10, color);
+  tft.fillRect(cx - 5, cy + 6, 10, 6, color);
+  tft.drawLine(cx - 5, cy + 13, cx + 5, cy + 13, color);
+  for (int i = 0; i < 6; i++) {
+    float angle = i * (PI / 3.0);
+    int x1 = cx + (int)(13 * cos(angle));
+    int y1 = (cy - 2) + (int)(13 * sin(angle));
+    int x2 = cx + (int)(18 * cos(angle));
+    int y2 = (cy - 2) + (int)(18 * sin(angle));
+    tft.drawLine(x1, y1, x2, y2, color);
+  }
+}
+
+void drawSnowflakeIcon(int cx, int cy, uint16_t color) {
+  const int armLength = 13;
+  for (int i = 0; i < 3; i++) {
+    float angle = i * (PI / 3.0);
+    int x1 = cx - (int)(armLength * cos(angle));
+    int y1 = cy - (int)(armLength * sin(angle));
+    int x2 = cx + (int)(armLength * cos(angle));
+    int y2 = cy + (int)(armLength * sin(angle));
+    tft.drawLine(x1, y1, x2, y2, color);
+  }
+}
+
+void drawAdviceIcon(AdviceIcon icon, int cx, int cy, uint16_t color) {
   switch (icon) {
-    case ICON_RAIN:  drawUmbrellaIcon(cx, cy, color); break;
-    case ICON_SUN:   drawSunIcon(cx, cy, color);       break;
-    case ICON_CLOUD: drawCloudIcon(cx, cy, color);     break;
+    case ICON_RAIN:      drawUmbrellaIcon(cx, cy, color);  break;
+    case ICON_SUN:        drawSunIcon(cx, cy, color);        break;
+    case ICON_CLOUD:      drawCloudIcon(cx, cy, ST77XX_WHITE); break;
+    case ICON_BULB:       drawBulbIcon(cx, cy, color);       break;
+    case ICON_SNOWFLAKE:  drawSnowflakeIcon(cx, cy, color);  break;
   }
 }
 
 // ---------------------------------------------------------------------------
-// drawFittedText - picks the largest text size that still fits the message
-// within the available width, so longer sentences stay readable.
+// drawWrappedCentredText - wraps a sentence onto multiple lines on word
+// boundaries, centres each line horizontally, and centres the whole block
+// vertically below the icon. Keeps everything big and easy to read.
 // ---------------------------------------------------------------------------
-void drawFittedText(String message, int x, int y, uint16_t color, int maxSize) {
-  int usableWidth = SCREEN_WIDTH - x - 4;
-  int chosenSize = 1;
+void drawWrappedCentredText(String message, int topY, uint16_t color, int textSize, int maxLines) {
+  int charWidth     = CHAR_PIXEL_WIDTH * textSize;
+  int charsPerLine  = (SCREEN_WIDTH - 16) / charWidth;
 
-  for (int size = maxSize; size >= 1; size--) {
-    int textWidth = message.length() * CHAR_PIXEL_WIDTH * size;
-    if (textWidth <= usableWidth) {
-      chosenSize = size;
+  String lines[4];
+  int lineCount = 0;
+  String remaining = message;
+
+  while (remaining.length() > 0 && lineCount < maxLines) {
+    if ((int)remaining.length() <= charsPerLine) {
+      lines[lineCount++] = remaining;
       break;
     }
+    int breakPoint = remaining.substring(0, charsPerLine).lastIndexOf(' ');
+    if (breakPoint <= 0) breakPoint = charsPerLine;
+    lines[lineCount++] = remaining.substring(0, breakPoint);
+    remaining = remaining.substring(breakPoint + 1);
   }
 
-  tft.setCursor(x, y);
-  tft.setTextSize(chosenSize);
+  int lineHeight = (8 * textSize) + 3;
+
+  tft.setTextSize(textSize);
   tft.setTextColor(color);
-  tft.println(message);
+
+  for (int i = 0; i < lineCount; i++) {
+    int textWidth = lines[i].length() * charWidth;
+    int startX = (SCREEN_WIDTH - textWidth) / 2;
+    if (startX < 4) startX = 4;
+    tft.setCursor(startX, topY + (i * lineHeight));
+    tft.println(lines[i]);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// TFT Screen 1 - friendly, plain-language summary with a weather icon
+// TFT Screen 1 - ONE big icon + ONE clear sentence telling the user what to
+// do, generated from all the sensor data. This is the whole friendly screen.
 // ---------------------------------------------------------------------------
 void drawFriendlyScreen(const SensorReading &data, float pressureTrend) {
   tft.fillScreen(COLOR_BG);
-  drawHeader("TODAY'S OUTLOOK");
+  drawHeader("TODAY'S ADVICE");
 
-  String      weatherMsg   = getWeatherAdvice(pressureTrend);
-  uint16_t    weatherColor = getWeatherColor(pressureTrend);
-  WeatherIcon weatherIcon  = getWeatherIcon(pressureTrend);
+  AdviceMessage advice = buildAdviceMessage(data, pressureTrend);
 
-  // Weather icon on the left, message fitted to the remaining width
-  drawWeatherIcon(weatherIcon, 18, 36, weatherColor);
-  drawFittedText(weatherMsg, 40, 28, weatherColor, BODY_TEXT_SIZE);
+  // Icon centred near the top, below the header (kept compact to leave
+  // more vertical room for the sentence below)
+  drawAdviceIcon(advice.icon, SCREEN_WIDTH / 2, 38, advice.color);
 
-  // Temperature + comfort, combined on one row
-  uint16_t tempColor = getTempColor(data.temperatureC);
-  tft.setCursor(4, 58);
-  tft.setTextSize(BIG_TEXT_SIZE);
-  tft.setTextColor(tempColor);
-  tft.print(data.temperatureC, 1);
-  tft.print("C");
+  // Sentence wrapped and centred below the icon, sized to fit ABOVE the
+  // footer hint with no overlap. Text area is between sentenceTopY and
+  // footerTopY, so we pick the largest size and shrink lines to fit inside.
+  const int sentenceTopY = 60;
+  const int footerTopY   = SCREEN_HEIGHT - 16; // leave room for footer text
+  const int availableHeight = footerTopY - sentenceTopY;
 
-  tft.setCursor(96, 66);
-  tft.setTextSize(FOOTER_TEXT_SIZE);
-  tft.setTextColor(COLOR_TEXT);
-  tft.println(getComfortMessage(data.temperatureC, data.humidityPct));
+  int textSize = SENTENCE_MAX_SIZE;
+  int lineHeight = (8 * textSize) + 3;
+  int maxLines = availableHeight / lineHeight;
+  if (maxLines < 1) maxLines = 1;
 
-  // UV line
-  uint16_t uvColor = getUVColor(data.uvIndex);
-  tft.setCursor(4, 92);
-  tft.setTextSize(BODY_TEXT_SIZE);
-  tft.setTextColor(uvColor);
-  tft.println(getUVAdvice(data.uvIndex));
+  int charWidth    = CHAR_PIXEL_WIDTH * textSize;
+  int charsPerLine = (SCREEN_WIDTH - 16) / charWidth;
+  int estimatedLines = (advice.sentence.length() / charsPerLine) + 1;
 
-  // Light line
-  tft.setCursor(4, 114);
-  tft.setTextSize(FOOTER_TEXT_SIZE);
-  tft.setTextColor(COLOR_LABEL);
-  tft.println(getLightDescription(data.lightLux));
+  // If the sentence won't fit at this size within the allowed lines, shrink
+  if (estimatedLines > maxLines) {
+    textSize = 1;
+    lineHeight = (8 * textSize) + 3;
+    maxLines = availableHeight / lineHeight;
+    if (maxLines < 1) maxLines = 1;
+  }
 
-  // Footer hint
-  tft.setCursor(150, 114);
+  drawWrappedCentredText(advice.sentence, sentenceTopY, advice.color, textSize, maxLines);
+
+  // Footer hint - always visible, centred, with a clear gap above it
   tft.setTextSize(FOOTER_TEXT_SIZE);
   tft.setTextColor(COLOR_WARN);
-  tft.print("D2: raw data ->");
+  const char* hint = "Press D2 for raw data";
+  int hintWidth = strlen(hint) * CHAR_PIXEL_WIDTH * FOOTER_TEXT_SIZE;
+  tft.setCursor((SCREEN_WIDTH - hintWidth) / 2, SCREEN_HEIGHT - 11);
+  tft.print(hint);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,12 +381,14 @@ void drawRawDataScreen(const SensorReading &data, float pressureTrend) {
   tft.fillScreen(COLOR_BG);
   drawHeader("RAW DATA");
 
-  int rowY = 28;
-  const int rowHeight = 18;
+  int rowY = 26;
+  const int rowHeight = 16;
+
+  tft.setTextWrap(false); // prevent long values wrapping into the row below
 
   auto drawRow = [&](const char* label, String value) {
     tft.setCursor(4, rowY);
-    tft.setTextSize(BODY_TEXT_SIZE);
+    tft.setTextSize(2);
     tft.setTextColor(COLOR_LABEL);
     tft.print(label);
     tft.setCursor(140, rowY);
@@ -360,7 +400,6 @@ void drawRawDataScreen(const SensorReading &data, float pressureTrend) {
   drawRow("Temp:",  String(data.temperatureC, 1) + "C");
   drawRow("Hum:",   String(data.humidityPct, 1) + "%");
   drawRow("Pres:",  String(data.pressureHPa, 0));
-  drawRow("Trend:", String(pressureTrend, 2));
   drawRow("UV:",    String(data.uvIndex, 1));
   drawRow("Light:", String(data.lightLux, 0));
 
