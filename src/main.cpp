@@ -1,3 +1,16 @@
+// =============================================================================
+// ESP32-S3 WEATHER ADVICE STATION
+//
+// Reads temperature, humidity, air pressure, UV index and light level from
+// three I2C sensors and turns them into ONE plain-English piece of advice
+// ("Rain is coming - grab an umbrella!") shown as a big icon + sentence on a
+// TFT screen. A second screen shows the raw numbers for anyone who wants them.
+//
+// Two buttons swap between the two screens. Bad or missing sensor readings
+// are detected and the display falls back to the last good reading instead
+// of showing garbage values.
+// =============================================================================
+
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_BMP280.h>
@@ -6,27 +19,36 @@
 #include <Adafruit_GFX.h>
 
 // ---------- Pin constants ----------
-const int      BUTTON_FRIENDLY_PIN = 1;   // D1
-const int      BUTTON_RAWDATA_PIN  = 2;   // D2
+const int      BUTTON_FRIENDLY_PIN = 1;   // D1 - shows the friendly advice screen
+const int      BUTTON_RAWDATA_PIN  = 2;   // D2 - shows the raw sensor data screen
 const int      TFT_BACKLIGHT_PIN   = TFT_BACKLITE;
 const uint16_t SCREEN_WIDTH        = 240;
 const uint16_t SCREEN_HEIGHT       = 135;
 
 // ---------- Sensor / calibration constants ----------
-const float    SEALEVEL_HPA        = 100.0F;
-const float    UV_SENSITIVITY      = 2300.0F;
+const float    PASCALS_PER_HPA     = 100.0F;  // BMP280 returns Pa; divide to get hPa
+const float    UV_SENSITIVITY      = 2300.0F; // LTR390 datasheet conversion factor
 const float    ALS_GAIN_FACTOR     = 3.0F;
 const float    ALS_INT_FACTOR      = 1.0F;
 const float    LUX_WFA_COEFF       = 0.6F;
-const unsigned long SENSOR_DELAY_MS = 120;
-const unsigned long LOOP_DELAY_MS   = 2000;
-const unsigned long DEBOUNCE_MS     = 250;
+const unsigned long SENSOR_SWITCH_DELAY_MS = 120; // settle time after changing LTR390 mode
+const unsigned long LOOP_DELAY_MS          = 2000;
+const unsigned long DEBOUNCE_MS            = 250;
 
 // Pressure-trend thresholds (hPa change over the tracking window)
 const float    PRESSURE_FALLING_FAST = -2.0F;  // sharp drop - rain likely soon
 const float    PRESSURE_FALLING_SLOW = -0.7F;  // gentle drop - rain possible later
 const float    PRESSURE_RISING_SLOW  = 0.7F;   // gentle rise - improving
-const int      PRESSURE_HISTORY_SIZE = 5;       // ~10 sec of readings at 2s loop
+const int      PRESSURE_HISTORY_SIZE = 5;      // ~10 sec of readings at 2s loop
+
+// ---------- Valid sensor ranges (used to catch disconnected/faulty sensors) ----------
+// Anything outside these physical ranges, or a NaN reading, is treated as an
+// invalid sample so a glitch never gets shown to the user as real weather data.
+const float    TEMP_MIN_C        = -40.0F, TEMP_MAX_C        = 85.0F;
+const float    HUMIDITY_MIN_PCT  = 0.0F,   HUMIDITY_MAX_PCT  = 100.0F;
+const float    PRESSURE_MIN_HPA  = 300.0F, PRESSURE_MAX_HPA  = 1100.0F;
+const float    UV_INDEX_MIN      = 0.0F,   UV_INDEX_MAX      = 20.0F;
+const float    LIGHT_LUX_MIN     = 0.0F,   LIGHT_LUX_MAX     = 100000.0F;
 
 // ---------- Text size constants ----------
 const int      HEADER_TEXT_SIZE   = 2;
@@ -50,6 +72,9 @@ Adafruit_LTR390 ltr;
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 
 // ---------- Data structure ----------
+// Groups one full set of sensor readings together so they can be passed
+// around and returned from functions as a single unit instead of five
+// separate loose variables.
 struct SensorReading {
   float temperatureC;
   float humidityPct;
@@ -82,7 +107,36 @@ float pressureHistory[PRESSURE_HISTORY_SIZE];
 int   pressureHistoryIndex = 0;
 bool  pressureHistoryFull  = false;
 
-// ---------------------------------------------------------------------------
+// ---------- Last-known-good reading, used as a fallback when a sample fails validation ----------
+SensorReading lastGoodReading = { 20.0F, 50.0F, 1013.0F, 0.0F, 100.0F }; // sensible defaults until first good read
+bool          haveGoodReading = false;
+
+// =============================================================================
+// isReadingValid - checks a sensor reading against physically-possible ranges
+// and rejects NaN values (which the Adafruit libraries return when a sensor
+// read fails). This is what stops a loose wire or a glitchy sample from being
+// shown to the user as real weather data.
+// =============================================================================
+bool isReadingValid(const SensorReading &data) {
+  if (isnan(data.temperatureC) || isnan(data.humidityPct) || isnan(data.pressureHPa) ||
+      isnan(data.uvIndex) || isnan(data.lightLux)) {
+    return false;
+  }
+
+  if (data.temperatureC < TEMP_MIN_C || data.temperatureC > TEMP_MAX_C)       return false;
+  if (data.humidityPct  < HUMIDITY_MIN_PCT || data.humidityPct > HUMIDITY_MAX_PCT) return false;
+  if (data.pressureHPa  < PRESSURE_MIN_HPA || data.pressureHPa > PRESSURE_MAX_HPA) return false;
+  if (data.uvIndex      < UV_INDEX_MIN || data.uvIndex > UV_INDEX_MAX)        return false;
+  if (data.lightLux     < LIGHT_LUX_MIN || data.lightLux > LIGHT_LUX_MAX)     return false;
+
+  return true;
+}
+
+// =============================================================================
+// readAllSensors - takes one reading from each of the three sensors (AHT20
+// temperature/humidity, BMP280 pressure, LTR390 UV/light) and packages the
+// results into a single SensorReading to hand back to the caller.
+// =============================================================================
 SensorReading readAllSensors() {
   SensorReading data;
 
@@ -91,20 +145,21 @@ SensorReading readAllSensors() {
   data.temperatureC = tempEvent.temperature;
   data.humidityPct  = humidityEvent.relative_humidity;
 
-  data.pressureHPa = bmp.readPressure() / SEALEVEL_HPA;
+  data.pressureHPa = bmp.readPressure() / PASCALS_PER_HPA;
 
+  // Default to 0 in case the LTR390 has no new data ready this cycle
   data.uvIndex  = 0;
   data.lightLux = 0;
 
   ltr.setMode(LTR390_MODE_UVS);
-  delay(SENSOR_DELAY_MS);
+  delay(SENSOR_SWITCH_DELAY_MS);
   if (ltr.newDataAvailable()) {
     uint32_t rawUV = ltr.readUVS();
     data.uvIndex = (float)rawUV / UV_SENSITIVITY;
   }
 
   ltr.setMode(LTR390_MODE_ALS);
-  delay(SENSOR_DELAY_MS);
+  delay(SENSOR_SWITCH_DELAY_MS);
   if (ltr.newDataAvailable()) {
     uint32_t rawALS = ltr.readALS();
     data.lightLux = (LUX_WFA_COEFF * (float)rawALS) / (ALS_GAIN_FACTOR * ALS_INT_FACTOR);
@@ -113,10 +168,35 @@ SensorReading readAllSensors() {
   return data;
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
+// getCurrentReading - the single point where the rest of the program gets its
+// sensor data from. It takes a fresh reading, validates it, and either
+// accepts it as the new "last known good" reading or falls back to the
+// previous good one. Returns the reading to use and reports (via the
+// isStale output parameter) whether that reading is a fallback.
+// =============================================================================
+SensorReading getCurrentReading(bool &isStale) {
+  SensorReading freshReading = readAllSensors();
+
+  if (isReadingValid(freshReading)) {
+    lastGoodReading = freshReading;
+    haveGoodReading = true;
+    isStale = false;
+    return freshReading;
+  }
+
+  // Invalid sample: warn on Serial and fall back to the last good reading
+  // (or the startup default if a good reading has never been captured yet).
+  Serial.println(F("[WARN] Invalid sensor reading rejected - using last known good data"));
+  isStale = true;
+  return lastGoodReading;
+}
+
+// =============================================================================
 // updatePressureTrend - tracks pressure over time in a circular buffer and
 // returns the change in hPa between the oldest and newest stored readings.
-// ---------------------------------------------------------------------------
+// A positive result means pressure is rising, negative means it's falling.
+// =============================================================================
 float updatePressureTrend(float currentPressure) {
   pressureHistory[pressureHistoryIndex] = currentPressure;
   pressureHistoryIndex = (pressureHistoryIndex + 1) % PRESSURE_HISTORY_SIZE;
@@ -129,12 +209,12 @@ float updatePressureTrend(float currentPressure) {
   return currentPressure - oldestPressure;
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // buildAdviceMessage - takes ALL the sensor data and the pressure trend and
 // returns ONE clear sentence telling the user what to do, picked by priority
 // (most important / urgent advice wins). This is the only thing the friendly
 // screen needs to know how to draw.
-// ---------------------------------------------------------------------------
+// =============================================================================
 AdviceMessage buildAdviceMessage(const SensorReading &data, float pressureTrend) {
   // Priority 1: rain warning - most actionable, affects whether you go outside
   if (pressureTrend <= PRESSURE_FALLING_FAST) {
@@ -177,12 +257,17 @@ AdviceMessage buildAdviceMessage(const SensorReading &data, float pressureTrend)
   return { "Conditions look comfortable - enjoy your day!", COLOR_GOOD, ICON_CLOUD };
 }
 
-// ---------------------------------------------------------------------------
-// Serial Monitor - raw data table, always printed regardless of screen mode
-// ---------------------------------------------------------------------------
-void printDataToSerial(const SensorReading &data, float pressureTrend) {
+// =============================================================================
+// printDataToSerial - Serial Monitor raw data table, always printed
+// regardless of which screen is showing. Also flags when the values being
+// shown are a fallback (stale) reading rather than a fresh sample.
+// =============================================================================
+void printDataToSerial(const SensorReading &data, float pressureTrend, bool isStale) {
   Serial.println();
   Serial.println(F("=========== SENSOR READINGS ==========="));
+  if (isStale) {
+    Serial.println(F("[STALE - showing last known good reading]"));
+  }
   Serial.printf("%-12s %8.1f %s\n", "Temperature", data.temperatureC, "C");
   Serial.printf("%-12s %8.1f %s\n", "Humidity",    data.humidityPct,  "%");
   Serial.printf("%-12s %8.1f %s\n", "Pressure",    data.pressureHPa,  "hPa");
@@ -192,9 +277,9 @@ void printDataToSerial(const SensorReading &data, float pressureTrend) {
   Serial.println(F("========================================"));
 }
 
-// ---------------------------------------------------------------------------
-// Header bar drawer
-// ---------------------------------------------------------------------------
+// =============================================================================
+// drawHeader - draws the coloured title bar shown at the top of both screens
+// =============================================================================
 void drawHeader(const char* title) {
   tft.fillRect(0, 0, SCREEN_WIDTH, 22, COLOR_HEADER);
   tft.setCursor(4, 3);
@@ -203,10 +288,10 @@ void drawHeader(const char* title) {
   tft.print(title);
 }
 
-// ---------------------------------------------------------------------------
-// Hand-drawn icons using basic GFX shapes (no emoji font available on TFT)
-// Each is drawn centred at (cx, cy)
-// ---------------------------------------------------------------------------
+// =============================================================================
+// Hand-drawn icons using basic GFX shapes (no emojis avaliable on TFT).
+// Each is drawn centred at (cx, cy) in the given colour.
+// =============================================================================
 void drawSunIcon(int cx, int cy, uint16_t color) {
   const int radius = 9;
   tft.fillCircle(cx, cy, radius, color);
@@ -277,21 +362,23 @@ void drawSnowflakeIcon(int cx, int cy, uint16_t color) {
   }
 }
 
+// Picks the right hand-drawn icon function based on the AdviceIcon enum value
 void drawAdviceIcon(AdviceIcon icon, int cx, int cy, uint16_t color) {
   switch (icon) {
-    case ICON_RAIN:      drawUmbrellaIcon(cx, cy, color);  break;
-    case ICON_SUN:        drawSunIcon(cx, cy, color);        break;
-    case ICON_CLOUD:      drawCloudIcon(cx, cy, ST77XX_WHITE); break;
-    case ICON_BULB:       drawBulbIcon(cx, cy, color);       break;
-    case ICON_SNOWFLAKE:  drawSnowflakeIcon(cx, cy, color);  break;
+    case ICON_RAIN:       drawUmbrellaIcon(cx, cy, color);     break;
+    case ICON_SUN:         drawSunIcon(cx, cy, color);           break;
+    case ICON_CLOUD:       drawCloudIcon(cx, cy, ST77XX_WHITE);  break;
+    case ICON_BULB:        drawBulbIcon(cx, cy, color);          break;
+    case ICON_SNOWFLAKE:   drawSnowflakeIcon(cx, cy, color);     break;
   }
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // drawWrappedCentredText - wraps a sentence onto multiple lines on word
-// boundaries, centres each line horizontally, and centres the whole block
-// vertically below the icon. Keeps everything big and easy to read.
-// ---------------------------------------------------------------------------
+// boundaries, centres each line horizontally, and lays the block out below
+// the icon. Keeps everything big and easy to read regardless of sentence
+// length.
+// =============================================================================
 void drawWrappedCentredText(String message, int topY, uint16_t color, int textSize, int maxLines) {
   int charWidth     = CHAR_PIXEL_WIDTH * textSize;
   int charsPerLine  = (SCREEN_WIDTH - 16) / charWidth;
@@ -325,11 +412,13 @@ void drawWrappedCentredText(String message, int topY, uint16_t color, int textSi
   }
 }
 
-// ---------------------------------------------------------------------------
-// TFT Screen 1 - ONE big icon + ONE clear sentence telling the user what to
-// do, generated from all the sensor data. This is the whole friendly screen.
-// ---------------------------------------------------------------------------
-void drawFriendlyScreen(const SensorReading &data, float pressureTrend) {
+// =============================================================================
+// drawFriendlyScreen - Screen 1: ONE big icon + ONE clear sentence telling
+// the user what to do, generated from all the sensor data. If the current
+// reading is a stale fallback, the footer hint says so instead of the
+// normal "press for raw data" prompt.
+// =============================================================================
+void drawFriendlyScreen(const SensorReading &data, float pressureTrend, bool isStale) {
   tft.fillScreen(COLOR_BG);
   drawHeader("TODAY'S ADVICE");
 
@@ -367,17 +456,19 @@ void drawFriendlyScreen(const SensorReading &data, float pressureTrend) {
 
   // Footer hint - always visible, centred, with a clear gap above it
   tft.setTextSize(FOOTER_TEXT_SIZE);
-  tft.setTextColor(COLOR_WARN);
-  const char* hint = "Press D2 for raw data";
+  tft.setTextColor(isStale ? COLOR_BAD : COLOR_WARN);
+  const char* hint = isStale ? "Sensor error - showing last reading" : "Press D2 for raw data";
   int hintWidth = strlen(hint) * CHAR_PIXEL_WIDTH * FOOTER_TEXT_SIZE;
   tft.setCursor((SCREEN_WIDTH - hintWidth) / 2, SCREEN_HEIGHT - 11);
   tft.print(hint);
 }
 
-// ---------------------------------------------------------------------------
-// TFT Screen 2 - raw numeric data
-// ---------------------------------------------------------------------------
-void drawRawDataScreen(const SensorReading &data, float pressureTrend) {
+// =============================================================================
+// drawRawDataScreen - Screen 2: raw numeric sensor data, one row per value.
+// Rows are drawn with a small local helper (a lambda) so the label/value
+// layout logic isn't repeated five times.
+// =============================================================================
+void drawRawDataScreen(const SensorReading &data, float pressureTrend, bool isStale) {
   tft.fillScreen(COLOR_BG);
   drawHeader("RAW DATA");
 
@@ -392,7 +483,7 @@ void drawRawDataScreen(const SensorReading &data, float pressureTrend) {
     tft.setTextColor(COLOR_LABEL);
     tft.print(label);
     tft.setCursor(140, rowY);
-    tft.setTextColor(COLOR_GOOD);
+    tft.setTextColor(isStale ? COLOR_BAD : COLOR_GOOD);
     tft.println(value);
     rowY += rowHeight;
   };
@@ -406,18 +497,25 @@ void drawRawDataScreen(const SensorReading &data, float pressureTrend) {
   tft.setCursor(4, SCREEN_HEIGHT - 10);
   tft.setTextSize(FOOTER_TEXT_SIZE);
   tft.setTextColor(COLOR_WARN);
-  tft.print("<- D1: summary");
+  tft.print(isStale ? "(stale) <- D1: summary" : "<- D1: summary");
 }
 
-void updateDisplay(const SensorReading &data, float pressureTrend) {
+// Chooses which screen to draw based on the currentScreen state, so the
+// main loop doesn't need to know about either screen's drawing details.
+void updateDisplay(const SensorReading &data, float pressureTrend, bool isStale) {
   if (currentScreen == SCREEN_FRIENDLY) {
-    drawFriendlyScreen(data, pressureTrend);
+    drawFriendlyScreen(data, pressureTrend, isStale);
   } else {
-    drawRawDataScreen(data, pressureTrend);
+    drawRawDataScreen(data, pressureTrend, isStale);
   }
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
+// checkButtons - reads both buttons with simple debouncing and switches
+// currentScreen when a fresh press is detected. Returns true if the screen
+// mode changed this call (available for callers that only want to redraw on
+// a genuine change).
+// =============================================================================
 bool checkButtons() {
   bool screenChanged = false;
   unsigned long now = millis();
@@ -443,6 +541,12 @@ bool checkButtons() {
   return screenChanged;
 }
 
+// =============================================================================
+// setup - runs once at power-on. Starts Serial and I2C, configures the
+// buttons and backlight, initialises the TFT, and brings up all three
+// sensors. Each sensor halts the program with a clear error message if it
+// fails to initialise, since the rest of the program cannot run without it.
+// =============================================================================
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
@@ -494,14 +598,21 @@ void setup() {
   Serial.println(F("----------------------------------------------------------"));
 }
 
+// =============================================================================
+// loop - runs continuously. Checks the buttons, takes a validated sensor
+// reading (falling back to the last good one if the fresh sample fails
+// validation), updates the pressure trend, and refreshes both the Serial
+// Monitor and the TFT display.
+// =============================================================================
 void loop() {
   checkButtons();
 
-  SensorReading currentReading = readAllSensors();
+  bool isStale = false;
+  SensorReading currentReading = getCurrentReading(isStale);
   float pressureTrend = updatePressureTrend(currentReading.pressureHPa);
 
-  printDataToSerial(currentReading, pressureTrend);
-  updateDisplay(currentReading, pressureTrend);
+  printDataToSerial(currentReading, pressureTrend, isStale);
+  updateDisplay(currentReading, pressureTrend, isStale);
 
   delay(LOOP_DELAY_MS);
 }
