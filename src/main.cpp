@@ -50,11 +50,23 @@ const float    PRESSURE_MIN_HPA  = 300.0F, PRESSURE_MAX_HPA  = 1100.0F;
 const float    UV_INDEX_MIN      = 0.0F,   UV_INDEX_MAX      = 20.0F;
 const float    LIGHT_LUX_MIN     = 0.0F,   LIGHT_LUX_MAX     = 100000.0F;
 
+// ---------- Advice trigger thresholds ----------
+// Named the same way as the validity ranges above, rather than left as bare
+// numbers inside buildAdviceMessage()'s if-statements.
+const float    ADVICE_UV_DANGEROUS        = 8.0F;   // uvIndex at/above this - "wear sunscreen now"
+const float    ADVICE_UV_STRONG           = 6.0F;   // uvIndex at/above this - "sunscreen recommended"
+const float    ADVICE_HOT_HUMID_TEMP_C    = 25.0F;  // paired with humidity below for muggy-day advice
+const float    ADVICE_HOT_HUMID_HUMIDITY_PCT = 50.0F;
+const float    ADVICE_HOT_TEMP_C          = 27.0F;  // "hot day" advice on its own
+const float    ADVICE_COLD_TEMP_C         = 15.0F;  // below this - "wear a jacket"
+const float    ADVICE_DARK_LUX            = 2.0F;   // below this - "turn on the lights"
+
 // ---------- Text size constants ----------
 const int      HEADER_TEXT_SIZE   = 2;
 const int      SENTENCE_MAX_SIZE  = 2;   // largest size tried for the advice sentence
 const int      FOOTER_TEXT_SIZE   = 1;
 const int      CHAR_PIXEL_WIDTH   = 6;   // base width of one character at text size 1
+const int      MAX_TEXT_LINES     = 6;   // real capacity of the lines[] buffer in drawWrappedCentredText
 
 // ---------- Colours ----------
 const uint16_t COLOR_BG       = ST77XX_BLACK;
@@ -225,26 +237,26 @@ AdviceMessage buildAdviceMessage(const SensorReading &data, float pressureTrend)
   }
 
   // Priority 2: dangerous UV - safety advice
-  if (data.uvIndex >= 8) {
+  if (data.uvIndex >= ADVICE_UV_DANGEROUS) {
     return { "UV is very high - wear sunscreen now!", COLOR_BAD, ICON_SUN };
   }
-  if (data.uvIndex >= 6) {
+  if (data.uvIndex >= ADVICE_UV_STRONG) {
     return { "Strong sun out - sunscreen recommended", COLOR_WARN, ICON_SUN };
   }
 
   // Priority 3: temperature comfort
-  if (data.temperatureC > 28 && data.humidityPct > 60) {
+  if (data.temperatureC > ADVICE_HOT_HUMID_TEMP_C && data.humidityPct > ADVICE_HOT_HUMID_HUMIDITY_PCT) {
     return { "Hot and humid - drink plenty of water", COLOR_WARN, ICON_SUN };
   }
-  if (data.temperatureC > 28) {
+  if (data.temperatureC > ADVICE_HOT_TEMP_C) {
     return { "It's a hot day - dress light and stay cool", COLOR_WARN, ICON_SUN };
   }
-  if (data.temperatureC < 15) {
+  if (data.temperatureC < ADVICE_COLD_TEMP_C) {
     return { "Feeling cold - wear a warm jacket", COLOR_LABEL, ICON_SNOWFLAKE };
   }
 
   // Priority 4: lighting
-  if (data.lightLux < 10) {
+  if (data.lightLux < ADVICE_DARK_LUX) {
     return { "It's dark - turn on the lights", COLOR_WARN, ICON_BULB };
   }
 
@@ -378,12 +390,23 @@ void drawAdviceIcon(AdviceIcon icon, int cx, int cy, uint16_t color) {
 // boundaries, centres each line horizontally, and lays the block out below
 // the icon. Keeps everything big and easy to read regardless of sentence
 // length.
+//
+// maxLines is clamped to MAX_TEXT_LINES (the real capacity of the lines[]
+// buffer below) before it's used anywhere. Without this, a caller-supplied
+// maxLines bigger than the array size - e.g. drawFriendlyScreen()'s layout
+// maths returning 5 while lines[] only held 4 - would let the wrapping loop
+// write one element past the end of the array. Clamping here means that can
+// never happen, no matter what value a caller passes in.
 // =============================================================================
 void drawWrappedCentredText(String message, int topY, uint16_t color, int textSize, int maxLines) {
+  if (maxLines > MAX_TEXT_LINES) {
+    maxLines = MAX_TEXT_LINES;
+  }
+
   int charWidth     = CHAR_PIXEL_WIDTH * textSize;
   int charsPerLine  = (SCREEN_WIDTH - 16) / charWidth;
 
-  String lines[4];
+  String lines[MAX_TEXT_LINES];
   int lineCount = 0;
   String remaining = message;
 
