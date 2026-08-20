@@ -124,24 +124,40 @@ SensorReading lastGoodReading = { 20.0F, 50.0F, 1013.0F, 0.0F, 100.0F }; // sens
 bool          haveGoodReading = false;
 
 // =============================================================================
-// isReadingValid - checks a sensor reading against physically-possible ranges
-// and rejects NaN values (which the Adafruit libraries return when a sensor
-// read fails). This is what stops a loose wire or a glitchy sample from being
-// shown to the user as real weather data.
+// getInvalidSensorName - checks a sensor reading field-by-field against
+// physically-possible ranges (and against NaN, which the Adafruit libraries
+// return when a sensor read fails), and returns the name of the FIRST sensor
+// whose value is out of range. Returns an empty string if every value is
+// valid. Checking field-by-field (rather than just true/false) is what lets
+// the rest of the program name the actual faulty sensor on screen, instead
+// of a generic "something is wrong" message.
+// =============================================================================
+String getInvalidSensorName(const SensorReading &data) {
+  if (isnan(data.temperatureC) || data.temperatureC < TEMP_MIN_C || data.temperatureC > TEMP_MAX_C) {
+    return "AHT20 (temperature)";
+  }
+  if (isnan(data.humidityPct) || data.humidityPct < HUMIDITY_MIN_PCT || data.humidityPct > HUMIDITY_MAX_PCT) {
+    return "AHT20 (humidity)";
+  }
+  if (isnan(data.pressureHPa) || data.pressureHPa < PRESSURE_MIN_HPA || data.pressureHPa > PRESSURE_MAX_HPA) {
+    return "BMP280";
+  }
+  if (isnan(data.uvIndex) || data.uvIndex < UV_INDEX_MIN || data.uvIndex > UV_INDEX_MAX) {
+    return "LTR390 (UV)";
+  }
+  if (isnan(data.lightLux) || data.lightLux < LIGHT_LUX_MIN || data.lightLux > LIGHT_LUX_MAX) {
+    return "LTR390 (light)";
+  }
+  return ""; // every value passed validation
+}
+
+// =============================================================================
+// isReadingValid - true if every field in the reading is within range. Built
+// on top of getInvalidSensorName() so the two can never disagree with each
+// other about what counts as valid.
 // =============================================================================
 bool isReadingValid(const SensorReading &data) {
-  if (isnan(data.temperatureC) || isnan(data.humidityPct) || isnan(data.pressureHPa) ||
-      isnan(data.uvIndex) || isnan(data.lightLux)) {
-    return false;
-  }
-
-  if (data.temperatureC < TEMP_MIN_C || data.temperatureC > TEMP_MAX_C)       return false;
-  if (data.humidityPct  < HUMIDITY_MIN_PCT || data.humidityPct > HUMIDITY_MAX_PCT) return false;
-  if (data.pressureHPa  < PRESSURE_MIN_HPA || data.pressureHPa > PRESSURE_MAX_HPA) return false;
-  if (data.uvIndex      < UV_INDEX_MIN || data.uvIndex > UV_INDEX_MAX)        return false;
-  if (data.lightLux     < LIGHT_LUX_MIN || data.lightLux > LIGHT_LUX_MAX)     return false;
-
-  return true;
+  return getInvalidSensorName(data).length() == 0;
 }
 
 // =============================================================================
@@ -184,23 +200,30 @@ SensorReading readAllSensors() {
 // getCurrentReading - the single point where the rest of the program gets its
 // sensor data from. It takes a fresh reading, validates it, and either
 // accepts it as the new "last known good" reading or falls back to the
-// previous good one. Returns the reading to use and reports (via the
-// isStale output parameter) whether that reading is a fallback.
+// previous good one. Reports (via the isStale and faultySensor output
+// parameters) whether that reading is a fallback, and if so, which sensor
+// caused it - so the display can name the actual problem rather than just
+// saying "something is wrong".
 // =============================================================================
-SensorReading getCurrentReading(bool &isStale) {
+SensorReading getCurrentReading(bool &isStale, String &faultySensor) {
   SensorReading freshReading = readAllSensors();
+  String invalidSensor = getInvalidSensorName(freshReading);
 
-  if (isReadingValid(freshReading)) {
+  if (invalidSensor.length() == 0) {
     lastGoodReading = freshReading;
     haveGoodReading = true;
     isStale = false;
+    faultySensor = "";
     return freshReading;
   }
 
   // Invalid sample: warn on Serial and fall back to the last good reading
   // (or the startup default if a good reading has never been captured yet).
-  Serial.println(F("[WARN] Invalid sensor reading rejected - using last known good data"));
+  Serial.print(F("[WARN] Invalid reading from "));
+  Serial.print(invalidSensor);
+  Serial.println(F(" rejected - using last known good data"));
   isStale = true;
+  faultySensor = invalidSensor;
   return lastGoodReading;
 }
 
@@ -272,13 +295,15 @@ AdviceMessage buildAdviceMessage(const SensorReading &data, float pressureTrend)
 // =============================================================================
 // printDataToSerial - Serial Monitor raw data table, always printed
 // regardless of which screen is showing. Also flags when the values being
-// shown are a fallback (stale) reading rather than a fresh sample.
+// shown are a fallback (stale) reading, and names the sensor that caused it.
 // =============================================================================
-void printDataToSerial(const SensorReading &data, float pressureTrend, bool isStale) {
+void printDataToSerial(const SensorReading &data, float pressureTrend, bool isStale, const String &faultySensor) {
   Serial.println();
   Serial.println(F("=========== SENSOR READINGS ==========="));
   if (isStale) {
-    Serial.println(F("[STALE - showing last known good reading]"));
+    Serial.print(F("[STALE - "));
+    Serial.print(faultySensor);
+    Serial.println(F(" fault, showing last known good reading]"));
   }
   Serial.printf("%-12s %8.1f %s\n", "Temperature", data.temperatureC, "C");
   Serial.printf("%-12s %8.1f %s\n", "Humidity",    data.humidityPct,  "%");
@@ -441,7 +466,7 @@ void drawWrappedCentredText(String message, int topY, uint16_t color, int textSi
 // reading is a stale fallback, the footer hint says so instead of the
 // normal "press for raw data" prompt.
 // =============================================================================
-void drawFriendlyScreen(const SensorReading &data, float pressureTrend, bool isStale) {
+void drawFriendlyScreen(const SensorReading &data, float pressureTrend, bool isStale, const String &faultySensor) {
   tft.fillScreen(COLOR_BG);
   drawHeader("TODAY'S ADVICE");
 
@@ -477,11 +502,19 @@ void drawFriendlyScreen(const SensorReading &data, float pressureTrend, bool isS
 
   drawWrappedCentredText(advice.sentence, sentenceTopY, advice.color, textSize, maxLines);
 
-  // Footer hint - always visible, centred, with a clear gap above it
+  // Footer hint - always visible, centred, with a clear gap above it.
+  // Names the specific faulty sensor (device name only, no parenthetical
+  // detail) rather than a generic "error" message, and keeps it short
+  // enough to always fit the footer's width at this text size.
   tft.setTextSize(FOOTER_TEXT_SIZE);
   tft.setTextColor(isStale ? COLOR_BAD : COLOR_WARN);
-  const char* hint = isStale ? "Sensor error - showing last reading" : "Press D2 for raw data";
-  int hintWidth = strlen(hint) * CHAR_PIXEL_WIDTH * FOOTER_TEXT_SIZE;
+  String shortSensorName = faultySensor;
+  int detailStart = shortSensorName.indexOf(" (");
+  if (detailStart > 0) {
+    shortSensorName = shortSensorName.substring(0, detailStart);
+  }
+  String hint = isStale ? (shortSensorName + " malfunctioned - check wiring") : "Press D2 for raw data";
+  int hintWidth = hint.length() * CHAR_PIXEL_WIDTH * FOOTER_TEXT_SIZE;
   tft.setCursor((SCREEN_WIDTH - hintWidth) / 2, SCREEN_HEIGHT - 11);
   tft.print(hint);
 }
@@ -491,7 +524,7 @@ void drawFriendlyScreen(const SensorReading &data, float pressureTrend, bool isS
 // Rows are drawn with a small local helper (a lambda) so the label/value
 // layout logic isn't repeated five times.
 // =============================================================================
-void drawRawDataScreen(const SensorReading &data, float pressureTrend, bool isStale) {
+void drawRawDataScreen(const SensorReading &data, float pressureTrend, bool isStale, const String &faultySensor) {
   tft.fillScreen(COLOR_BG);
   drawHeader("RAW DATA");
 
@@ -517,20 +550,61 @@ void drawRawDataScreen(const SensorReading &data, float pressureTrend, bool isSt
   drawRow("UV:",    String(data.uvIndex, 1));
   drawRow("Light:", String(data.lightLux, 0));
 
+  // Extra warning line, only shown when the reading is stale, naming the
+  // faulty sensor and suggesting the most likely fix - a loose or
+  // disconnected wire is the usual cause of an out-of-range I2C reading.
+  if (isStale) {
+    String shortSensorName = faultySensor;
+    int detailStart = shortSensorName.indexOf(" (");
+    if (detailStart > 0) {
+      shortSensorName = shortSensorName.substring(0, detailStart);
+    }
+    tft.setCursor(4, rowY + 2);
+    tft.setTextSize(FOOTER_TEXT_SIZE);
+    tft.setTextColor(COLOR_BAD);
+    tft.print(shortSensorName + " malfunctioning - check wires");
+  }
+
   tft.setCursor(4, SCREEN_HEIGHT - 10);
   tft.setTextSize(FOOTER_TEXT_SIZE);
   tft.setTextColor(COLOR_WARN);
-  tft.print(isStale ? "(stale) <- D1: summary" : "<- D1: summary");
+  tft.print("<- D1: summary");
 }
 
 // Chooses which screen to draw based on the currentScreen state, so the
 // main loop doesn't need to know about either screen's drawing details.
-void updateDisplay(const SensorReading &data, float pressureTrend, bool isStale) {
+void updateDisplay(const SensorReading &data, float pressureTrend, bool isStale, const String &faultySensor) {
   if (currentScreen == SCREEN_FRIENDLY) {
-    drawFriendlyScreen(data, pressureTrend, isStale);
+    drawFriendlyScreen(data, pressureTrend, isStale, faultySensor);
   } else {
-    drawRawDataScreen(data, pressureTrend, isStale);
+    drawRawDataScreen(data, pressureTrend, isStale, faultySensor);
   }
+}
+
+// =============================================================================
+// drawSensorErrorScreen - shown on the TFT if a sensor fails to initialise
+// at power-on. Without this, a disconnected/faulty sensor only produces a
+// Serial message, which nobody sees once the board is running standalone
+// (unplugged from a computer). This makes the fault visible on the device
+// itself, and names which sensor to check.
+// =============================================================================
+void drawSensorErrorScreen(const char* sensorName) {
+  tft.fillScreen(COLOR_BG);
+  drawHeader("SENSOR ERROR");
+
+  tft.setTextSize(2);
+  tft.setTextColor(COLOR_BAD);
+  tft.setCursor(4, 40);
+  tft.print(sensorName);
+
+  tft.setTextSize(FOOTER_TEXT_SIZE);
+  tft.setTextColor(COLOR_WARN);
+  tft.setCursor(4, 70);
+  tft.print("not found - check wiring");
+  tft.setCursor(4, 86);
+  tft.print("and I2C connections, then");
+  tft.setCursor(4, 102);
+  tft.print("reset the board.");
 }
 
 // =============================================================================
@@ -590,6 +664,7 @@ void setup() {
 
   if (!aht.begin()) {
     Serial.println(F("[ERROR] AHT20 not found! Check wiring."));
+    drawSensorErrorScreen("AHT20");
     while (1) delay(100);
   }
   Serial.println(F("[OK] AHT20 ready"));
@@ -597,6 +672,7 @@ void setup() {
   if (!bmp.begin(0x76)) {
     if (!bmp.begin(0x77)) {
       Serial.println(F("[ERROR] BMP280 not found! Check wiring / address."));
+      drawSensorErrorScreen("BMP280");
       while (1) delay(100);
     }
   }
@@ -609,6 +685,7 @@ void setup() {
 
   if (!ltr.begin()) {
     Serial.println(F("[ERROR] LTR390 not found! Check wiring."));
+    drawSensorErrorScreen("LTR390");
     while (1) delay(100);
   }
   ltr.setMode(LTR390_MODE_UVS);
@@ -631,11 +708,12 @@ void loop() {
   checkButtons();
 
   bool isStale = false;
-  SensorReading currentReading = getCurrentReading(isStale);
+  String faultySensor = "";
+  SensorReading currentReading = getCurrentReading(isStale, faultySensor);
   float pressureTrend = updatePressureTrend(currentReading.pressureHPa);
 
-  printDataToSerial(currentReading, pressureTrend, isStale);
-  updateDisplay(currentReading, pressureTrend, isStale);
+  printDataToSerial(currentReading, pressureTrend, isStale, faultySensor);
+  updateDisplay(currentReading, pressureTrend, isStale, faultySensor);
 
   delay(LOOP_DELAY_MS);
 }
